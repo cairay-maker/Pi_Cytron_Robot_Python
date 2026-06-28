@@ -60,6 +60,18 @@ GREEN_MIN_AREA = 1200
 # Default: middle of frame. Raise it if you want "Dn" zone to be larger.
 GREEN_SPLIT_Y = PROCESS_HEIGHT // 2      # ← tune this (0=top, 180=bottom)
 
+# ================== LINE DETECTION CONFIG ==================
+# CLOSE_KERNEL_SIZE must bridge the gap between the two tape edges in binary
+# Tape is ~1cm wide = ~20px at 320x180 with 16cm wide FOV
+# Too small → double white line, centroid on edge not center
+# Too large → merges tape with nearby noise blobs
+# Start at 21, increase if still seeing double line
+CLOSE_KERNEL_SIZE = 41     # ← tune this
+
+# Pre-filter: contours smaller than this are ignored before scoring
+# Too low → slow (processes noise), Too high → misses thin line sections  
+MIN_CONTOUR_AREA = 800
+
 # ================================================================
 # BLOCK 2: CAMERA SETUP
 # Future: move to vision/camera.py
@@ -224,8 +236,15 @@ while True:
     # blurred = cv2.GaussianBlur(gray, (BLUR_SIZE, BLUR_SIZE), 0) if BLUR_SIZE >= 3 else gray
     blurred = gray  # Skip blurring for performance; can be re-enabled if needed.
 
+    #block=11  → reacts to tiny local changes → shadow edges look like tape edges
+    #block=21  → averages over 21px area      → gentle shadow gradients ignored
+    #block=31  → averages over 31px area      → only strong dark areas survive
+    #constant=8   → pixel must be 8 brightness units darker than local avg
+    #constant=12  → pixel must be 12 units darker → shadow (faint) gets excluded
+    #constant=16  → only the darkest areas survive → tape yes, shadow no
+
     binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY_INV, 11, 8)
+                                   cv2.THRESH_BINARY_INV, 21, 16)
     # Threshold tuning reference:
     #   Block size (arg 5): must be odd. Small(7-11)=sensitive/noisy. Large(31-51)=smooth/robust.
     #   Constant  (arg 6):  Low(2-4)=picks up faint edges. High(8-16)=only strong dark areas survive.
@@ -233,8 +252,13 @@ while True:
     # Subtract green mask — prevents dark green squares confusing the line detector
     binary = cv2.bitwise_and(binary, cv2.bitwise_not(green_mask))
 
-    kernel = np.ones((3, 3), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    # CLOSE kernel must be wide enough to bridge both edges of the tape
+    # Tape = ~1cm wide = ~20px at your camera scale (320x180, 16cm wide)
+    # kernel (3,3) = only bridges 3px gap → too small, leaves double edge
+    # kernel (21,21) = bridges ~21px gap → merges both edges into one solid blob
+    # Tune CLOSE_KERNEL_SIZE up until binary shows ONE solid white line, not two
+    close_kernel = np.ones((CLOSE_KERNEL_SIZE, CLOSE_KERNEL_SIZE), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel)
 
     t_line_pre = time.perf_counter()
 
@@ -250,7 +274,6 @@ while True:
     # MIN_CONTOUR_AREA tuning:
     #   Too low  → slow, noise contours still processed
     #   Too high → may miss thin line sections
-    MIN_CONTOUR_AREA = 300
     contours = [c for c in contours if cv2.contourArea(c) > MIN_CONTOUR_AREA]
 
     error = 0
