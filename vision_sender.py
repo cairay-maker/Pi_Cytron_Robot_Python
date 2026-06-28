@@ -60,12 +60,13 @@ GREEN_MIN_AREA = 1200
 # Default: middle of frame. Raise it if you want "Dn" zone to be larger.
 GREEN_SPLIT_Y = PROCESS_HEIGHT // 2      # ← tune this (0=top, 180=bottom)
 
-# How many pixels to shrink the green mask inward before subtracting from binary
-# Protects tape pixels running along the edge of the green square
-# 10px = 0.5cm at your camera scale (1cm = 20px)
-# Too small → holes in tape near green edge
-# Too large → green square edges detected as tape
-GREEN_SUBTRACT_INSET = 2      # ← tune: try 5, 10, 15
+# Padding around green bounding box used in Plan B centroid filtering
+# Contour points within GREEN_EXCLUSION_PAD pixels of a green square edge
+# are excluded from centroid calculation
+# 3px = ~1.5mm at your camera scale (1cm = 20px)
+# Too small → green edge pixels still influence centroid
+# Too large → excludes too much tape near the green square
+GREEN_EXCLUSION_PAD = 3        # ← tune: try 3, 5, 8
 
 # ================== LINE DETECTION CONFIG ==================
 # Camera sees 16cm wide x 9cm tall → 1cm = 20px in both axes (square mapping)
@@ -230,13 +231,15 @@ while True:
 
     # ================================================================
     # BLOCK 5: GREEN SQUARE DETECTION
-    # Done FIRST so green mask can be subtracted from line binary below
+    # Done FIRST so green blob positions are available for Plan B
+    # centroid filtering in Block 8
     # Future: move to vision/green_detector.py → green.detect(frame)
     # ================================================================
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     green_mask = cv2.inRange(hsv, LOWER_GREEN, UPPER_GREEN)
-    green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    green_contours, _ = cv2.findContours(green_mask, cv2.RETR_EXTERNAL,
+                                          cv2.CHAIN_APPROX_SIMPLE)
 
     CENTER_X = PROCESS_WIDTH // 2
 
@@ -259,6 +262,19 @@ while True:
 
     # Sort blobs by y descending — closest to robot first
     green_blobs.sort(key=lambda b: b["cy"], reverse=True)
+
+    # Build green exclusion boxes for Plan B centroid filtering (Block 8)
+    # Each box is (x1, y1, x2, y2) with GREEN_EXCLUSION_PAD border added
+    # These boxes define regions where contour points are NOT used for centroid
+    green_boxes = []
+    for blob in green_blobs:
+        gx, gy, gw, gh = cv2.boundingRect(blob["contour"])
+        green_boxes.append((
+            gx - GREEN_EXCLUSION_PAD,
+            gy - GREEN_EXCLUSION_PAD,
+            gx + gw + GREEN_EXCLUSION_PAD,
+            gy + gh + GREEN_EXCLUSION_PAD
+        ))
 
     t_green = time.perf_counter()
 
@@ -328,31 +344,20 @@ while True:
     #
     # PIPELINE EXPLANATION — why this order matters:
     #
-    #   Step 1: threshold → finds ALL dark areas including tape AND dark parts of green
-    #   Step 2: subtract green_mask → removes green square pixels from binary
-    #           This may create small holes where green overlaps tape edge
-    #   Step 3: MORPH_CLOSE → fills holes left by subtraction + bridges tape edges
-    #           CRITICAL: close AFTER subtract so it repairs the holes
-    #           If close were BEFORE subtract, green would be inside the filled blob
-    #           and subtraction would punch holes through the merged tape shape
+    #   Step 1: threshold → finds ALL dark areas including tape
+    #   Step 2: NO green subtraction (Plan B — see Block 8)
+    #           Previous approach subtracted green_mask from binary here,
+    #           which created holes in tape where green overlapped tape edge.
+    #           Plan B instead filters green zones from centroid math only,
+    #           leaving binary intact so CLOSE can work on the full tape shape.
+    #   Step 3: MORPH_CLOSE → fills gap between tape edges into one solid blob
     #
-    #   ┌─────────────────────────────────────────────────────┐
-    #   │  threshold  →  subtract green  →  CLOSE  →  contours│
-    #   │  (find dark)   (remove green)   (repair+merge)       │
-    #   └─────────────────────────────────────────────────────┘
-    #
-    # WHY THE GROK "BORDER-ONLY" APPROACH WAS REVERTED:
-    #   Grok's approach subtracted only the 3px border of the green contour
-    #   instead of the full green area. This was counterproductive because:
-    #   1. The border is EXACTLY where green overlaps the tape edge — subtracting
-    #      only the border still removes tape pixels at the overlap point
-    #   2. Leaving the green interior in binary means the green square's dark
-    #      shadow/border gets merged INTO the tape blob by MORPH_CLOSE, making
-    #      the detected tape shape larger and shifting the centroid toward the green
-    #   3. The original full-area subtraction is correct — any holes it creates
-    #      in the tape are repaired by the CLOSE kernel that follows immediately
-    #   The correct fix for green-tape overlap is to ensure CLOSE_KERNEL_SIZE is
-    #   large enough to bridge any holes left by the subtraction (currently 41px = 2cm)
+    #   ┌──────────────────────────────────────────────────────────┐
+    #   │  threshold  →  (no subtraction)  →  CLOSE  →  contours  │
+    #   │  (find dark)                       (merge edges)         │
+    #   │                                                          │
+    #   │  Green zones excluded LATER at centroid math (Block 8)  │
+    #   └──────────────────────────────────────────────────────────┘
     # ================================================================
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -368,50 +373,51 @@ while True:
                                    cv2.THRESH_BINARY_INV,
                                    THRESH_BLOCK_SIZE, THRESH_CONSTANT)
 
-    # Save binary BEFORE green subtraction for debug window comparison
-    # This lets you see exactly what the subtraction is removing
-    # Shown in "Debug - Binary BEFORE subtraction" window
-    binary_before_sub = binary.copy()
+    # Save binary BEFORE close for debug window — shows raw threshold output
+    # Compare with AFTER to verify CLOSE kernel is merging tape edges correctly
+    binary_before_close = binary.copy()
 
-# Step 2: Subtract green mask from binary — with 10px inset border
-    #
-    # PROBLEM: subtracting the full green mask removes tape pixels that run
-    # along the edge of the green square, creating holes in binary AFTER.
-    #
-    # FIX: erode the green mask by 10px before subtracting
-    # This shrinks the subtracted area inward by 10px on all sides,
-    # leaving a 10px border around the green square where tape can still
-    # be detected. The CLOSE kernel then bridges any remaining small holes.
-    #
-    # 10px = 0.5cm at your camera scale (1cm = 20px)
-    # Tune GREEN_SUBTRACT_INSET if:
-    #   Too small (< 5px) → still punches holes in tape near square edge
-    #   Too large (> 15px) → leaves too much green area in binary,
-    #                         green square edges get detected as tape
-
-    inset_kernel = np.ones((GREEN_SUBTRACT_INSET * 2 + 1,
-                            GREEN_SUBTRACT_INSET * 2 + 1), np.uint8)
-    green_mask_inset = cv2.erode(green_mask, inset_kernel, iterations=1)
-
-    # Subtract the inset (smaller) mask — only removes the inner part of the
-    # green square, leaving a 10px border ring untouched in binary
-    binary = cv2.bitwise_and(binary, cv2.bitwise_not(green_mask_inset))
-
-    # Expose both masks to debug windows
-    green_mask_debug = green_mask_inset   # what actually gets subtracted
+    # Step 2: NO green subtraction from binary
+    # Green squares are excluded later at centroid calculation (Plan B in Block 8)
+    # This avoids holes in tape when green overlaps the black line edge
+    # Reason for change: binary subtraction created artifact black squares
+    # mirrored from green square position, especially when green was partially
+    # detected or on HSV boundary causing irregular mask shapes
 
     # Step 3: MORPH_CLOSE fills the gap between the two tape edge lines → one solid blob
-    # Also repairs any holes punched by the green subtraction in step 2
+    # Also repairs any minor gaps in the tape from noise
     # Kernel must be >= tape width (20px) to bridge both edges
     # At kernel 41: bridges up to ~2cm gap, cleanly merges both edges
-    # This MUST come AFTER subtraction so holes from step 2 get filled here
+    # MUST come after threshold — no green subtraction to interfere
     close_kernel = np.ones((CLOSE_KERNEL_SIZE, CLOSE_KERNEL_SIZE), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel)
 
     t_line_pre = time.perf_counter()
 
     # ================================================================
-    # BLOCK 8: LINE CONTOUR DETECTION + LOOKAHEAD + GAP BRIDGING
+    # BLOCK 8: LINE CONTOUR DETECTION + PLAN B GREEN FILTERING
+    #          + LOOKAHEAD + GAP BRIDGING
+    #
+    # PLAN B — GREEN EXCLUSION AT CENTROID LEVEL:
+    #   Instead of subtracting green from binary (which damaged the tape shape),
+    #   we find the contour normally from the full binary, then filter out
+    #   contour points that fall inside green square bounding boxes BEFORE
+    #   computing moments/centroid.
+    #
+    #   Benefits over binary subtraction:
+    #   ✓ Binary stays intact → CLOSE kernel always gets full tape shape
+    #   ✓ No holes punched in tape → no artifacts near green square edges
+    #   ✓ Centroid reflects tape center only, green square ignored
+    #   ✓ Works correctly even when green partially overlaps tape
+    #   ✓ No flicker — each frame processed independently, no temporal state
+    #
+    #   How it works:
+    #   1. Find contour normally from full binary (includes green area if any)
+    #   2. Get all contour points as numpy array
+    #   3. Build boolean mask: True = point outside ALL green bounding boxes
+    #   4. Compute moments only from the surviving (outside) points
+    #   5. Centroid and topmost point both use filtered points
+    #
     # Full frame used — ROI_TOP rectangle is visual reference only
     # Future: move to vision/line_detector.py → line.detect(binary)
     # ================================================================
@@ -430,9 +436,14 @@ while True:
     main_contour = None
 
     # Lookahead display points — set when contour found, used in drawing block
-    cx_centroid = PROCESS_WIDTH // 2   # center of mass x (where line IS)
-    cx_top      = PROCESS_WIDTH // 2   # topmost point x (where line is HEADING)
-    topmost_y   = 0                    # y coordinate of topmost point (for display)
+    cx_centroid  = PROCESS_WIDTH // 2   # center of mass x (where line IS)
+    cx_top       = PROCESS_WIDTH // 2   # topmost point x (where line is HEADING)
+    topmost_y    = 0                    # y coordinate of topmost point (for display)
+
+    # Plan B debug — filtered points count (shown on display)
+    filtered_pts       = None           # contour points after green exclusion
+    pts_total          = 0              # total contour points before filtering
+    pts_after_filter   = 0             # points remaining after green exclusion
 
     # gap_flag default — updated below based on detection result
     gap_flag = GAP_FLAG_NORMAL
@@ -457,10 +468,49 @@ while True:
                 main_contour = cnt
 
         if main_contour is not None:
+
+            # ── PLAN B: FILTER CONTOUR POINTS — exclude green zones ──────
+            # Extract all contour points as flat (N, 2) numpy array
+            # main_contour shape is (N, 1, 2) → squeeze to (N, 2)
+            pts = main_contour[:, 0, :]        # shape (N, 2): each row = [x, y]
+            pts_total = len(pts)
+
+            if green_boxes:
+                # Build boolean array: True = point is OUTSIDE all green boxes
+                # Start with all True (all outside), then mark inside points False
+                outside = np.ones(len(pts), dtype=bool)
+
+                for (x1, y1, x2, y2) in green_boxes:
+                    # Points inside this green box: x in [x1,x2] AND y in [y1,y2]
+                    inside_box = ((pts[:, 0] >= x1) & (pts[:, 0] <= x2) &
+                                  (pts[:, 1] >= y1) & (pts[:, 1] <= y2))
+                    # Exclude these points (AND with NOT inside)
+                    outside &= ~inside_box
+
+                filtered_pts     = pts[outside]     # points outside all green boxes
+                pts_after_filter = len(filtered_pts)
+
+                # Need at least 5 points for moments to be meaningful
+                # If too few survive, green square covers most of tape —
+                # fall back to full contour (better than wrong centroid)
+                if pts_after_filter >= 5:
+                    contour_for_centroid = filtered_pts.reshape(-1, 1, 2)
+                else:
+                    # Fallback: green covers most of tape, use full contour
+                    # This is rare but prevents crash on edge case
+                    contour_for_centroid = main_contour
+                    filtered_pts = pts   # show all points in debug
+            else:
+                # No green blobs — use full contour unchanged
+                contour_for_centroid = main_contour
+                filtered_pts         = pts
+                pts_after_filter     = pts_total
+
             # ── CENTROID ERROR (where the line IS) ──────────────────────
             # Moments give the center of mass of the contour blob
+            # Uses green-filtered contour → green square pixels excluded
             # On a curve this LAGS behind the exit direction
-            M = cv2.moments(main_contour)
+            M = cv2.moments(contour_for_centroid)
             if M["m00"] > 100:
                 cx_centroid    = int(M["m10"] / M["m00"])
                 error_centroid = cx_centroid - CENTER_X
@@ -469,20 +519,23 @@ while True:
                 error_centroid = 0
 
             # ── TOPMOST POINT ERROR (where the line is HEADING) ─────────
-            # The topmost point of the contour = where the line exits the
-            # top of the camera view = the furthest ahead point visible.
-            # On a curve, this point shifts LEFT or RIGHT earlier than the
-            # centroid does, giving the robot advance warning to steer.
+            # The topmost point of the filtered contour = where the line
+            # exits the top of the camera view = furthest ahead point visible
+            # Also filtered to exclude green zones so lookahead target
+            # isn't pulled toward the top edge of a green square
             #
             # Example on a right curve:
             #   centroid says: error = +30  (line slightly right)
             #   topmost  says: error = +90  (line heading far right)
             #   blend 0.7:     error = +72  → robot steers harder right earlier
-            topmost_idx = main_contour[:, :, 1].argmin()   # index of min Y value
-            topmost_pt  = tuple(main_contour[topmost_idx][0])
-            cx_top      = topmost_pt[0]
-            topmost_y   = topmost_pt[1]
-            error_top   = cx_top - CENTER_X
+            if len(contour_for_centroid) > 0:
+                topmost_idx = contour_for_centroid[:, :, 1].argmin()
+                topmost_pt  = tuple(contour_for_centroid[topmost_idx][0])
+            else:
+                topmost_pt  = (CENTER_X, ROI_TOP)
+            cx_top    = topmost_pt[0]
+            topmost_y = topmost_pt[1]
+            error_top = cx_top - CENTER_X
 
             # ── BLENDED ERROR (sent to Cytron) ───────────────────────────
             # LOOKAHEAD_WEIGHT = 0.0 → pure centroid (original behaviour)
@@ -500,6 +553,8 @@ while True:
             gap_flag        = GAP_FLAG_NORMAL
 
             # ── DRAW MAIN CONTOUR (semi-transparent red fill + green border) ─
+            # Full contour drawn (not filtered) so you can see the complete
+            # tape shape including any green square overlap area
             # Lighter fill (0.25 alpha) so underlying frame is still readable
             overlay = display.copy()
             scaled = [[int(p[0][0] * DISPLAY_SCALE), int(p[0][1] * DISPLAY_SCALE)]
@@ -507,6 +562,19 @@ while True:
             cv2.drawContours(overlay, [np.array(scaled)], -1, COLOR_RED, -1)
             cv2.addWeighted(overlay, 0.25, display, 0.75, 0, display)  # 25% red fill
             cv2.drawContours(display, [np.array(scaled)], -1, COLOR_GREEN, 4)
+
+            # ── DRAW FILTERED POINTS (Plan B debug visualization) ────────
+            # CYAN polyline = contour points that actually voted for centroid
+            # Disappears where tape runs through/near green square bounding box
+            # If cyan line looks correct (follows tape away from green),
+            # Plan B is working as intended
+            if filtered_pts is not None and len(filtered_pts) >= 2:
+                scaled_filtered = np.array(
+                    [[int(p[0] * DISPLAY_SCALE), int(p[1] * DISPLAY_SCALE)]
+                     for p in filtered_pts], dtype=np.int32)
+                cv2.polylines(display, [scaled_filtered], False, COLOR_CYAN, 2)
+                # CYAN = points used for centroid
+                # Gap in cyan = green square exclusion zone working
 
             # Draw secondary contours for debugging
             for cnt in sorted_contours[:5]:
@@ -597,6 +665,18 @@ while True:
             cv2.putText(display, dist_label, (dx + 6, label_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLOR_ORANGE, 2)
 
+        # Draw green exclusion box on display for Plan B debug
+        # Shows exactly which area is excluded from centroid calculation
+        # Drawn in magenta dashed-style (thin) so it doesn't obscure other info
+        for (x1, y1, x2, y2) in green_boxes:
+            ex1 = int(x1 * DISPLAY_SCALE)
+            ey1 = int(y1 * DISPLAY_SCALE)
+            ex2 = int(x2 * DISPLAY_SCALE)
+            ey2 = int(y2 * DISPLAY_SCALE)
+            cv2.rectangle(display, (ex1, ey1), (ex2, ey2), COLOR_MAGENTA, 1)
+            # MAGENTA rectangle = exclusion zone boundary
+            # Points inside this box are NOT used for centroid
+
     # ================================================================
     # BLOCK 11: DISPLAY — OVERLAYS (rulers, ROI, zones, status, packet)
     # Future: move to display/debug_view.py → view.draw_overlays(...)
@@ -612,6 +692,7 @@ while True:
     # Only draw when contour was found (main_contour is not None)
     if main_contour is not None:
         # Centroid dot — where the line center of mass IS (magenta hollow circle)
+        # Computed from green-filtered contour points
         centroid_disp_x = int(cx_centroid * DISPLAY_SCALE)
         centroid_disp_y = detected_y
         cv2.circle(display, (centroid_disp_x, centroid_disp_y),
@@ -619,6 +700,7 @@ while True:
 
         # Topmost point dot — where the line is HEADING (white filled circle)
         # This is the lookahead point — furthest visible point on the line ahead
+        # Also computed from filtered points — excludes green square top edges
         top_disp_x = int(cx_top    * DISPLAY_SCALE)
         top_disp_y = int(topmost_y * DISPLAY_SCALE)
         cv2.circle(display, (top_disp_x, top_disp_y),
@@ -734,13 +816,21 @@ while True:
         cv2.putText(display, f"Dist: {distance_px}px ({distance_px//20}cm)",
                     (15, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_ORANGE, 2)
 
-    # Lookahead blend info — shows centroid error, topmost error, weight and result
+    # Lookahead blend info — shows centroid error, topmost error, weight, result
     # Use this to tune LOOKAHEAD_WEIGHT: watch C and T diverge on curves
     if main_contour is not None:
         cv2.putText(display,
                     f"C:{cx_centroid - CENTER_X:+d} T:{cx_top - CENTER_X:+d} "
                     f"W:{LOOKAHEAD_WEIGHT:.1f} →{error:+d}",
                     (15, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1)
+
+    # Plan B filter stats — shows how many contour points survived green exclusion
+    # pts_total=N pts_after_filter=M → M points used for centroid out of N total
+    # If M is much smaller than N near green square → exclusion is working
+    if main_contour is not None and green_boxes:
+        cv2.putText(display,
+                    f"PlanB: {pts_after_filter}/{pts_total}pts used",
+                    (15, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_CYAN, 1)
 
     # ── Raw packet display — top right corner (BEFORE imshow) ────────
     packet_str = f"V:{error},{green_code},{len(green_blobs)},{distance_px},{gap_flag}"
@@ -761,25 +851,23 @@ while True:
     t_imshow = time.perf_counter()
 
     # ================================================================
-    # BLOCK 13: DEBUG WINDOWS — BINARY (before + after) AND GREEN MASK
+    # BLOCK 13: DEBUG WINDOWS — BINARY AND GREEN MASK
     # Refreshed every DEBUG_REFRESH_FRAMES to reduce CPU load
     #
-    # THREE binary debug windows to diagnose green subtraction:
-    #   "Debug - Binary BEFORE" : raw threshold output, no subtraction yet
-    #                             Use this to check if threshold is picking up shadows
-    #   "Debug - Binary AFTER"  : after green subtraction + CLOSE kernel applied
-    #                             Use this to check if subtraction punches holes in tape
-    #                             and whether CLOSE kernel repairs them correctly
+    # TWO binary debug windows to diagnose threshold and CLOSE kernel:
+    #   "Debug - Binary BEFORE" : raw threshold output before CLOSE
+    #                             Shows two white edge lines for the tape
+    #                             Use this to check threshold parameters
+    #   "Debug - Binary AFTER"  : after CLOSE kernel applied
+    #                             Should show ONE solid white blob per tape section
+    #                             Green square may appear here but is handled
+    #                             by Plan B at centroid level, not here
     #   "Debug - Green Mask"    : shows which pixels are classified as green
     #                             Use this to check green detection range
     #
-    # How to use these windows to diagnose overlap issues:
-    #   1. Place green square next to / overlapping black tape
-    #   2. Compare BEFORE vs AFTER:
-    #      - BEFORE shows tape as solid white blob
-    #      - AFTER should still show tape as solid white (CLOSE repairs holes)
-    #      - If AFTER has holes in the tape → increase CLOSE_KERNEL_SIZE
-    #      - If AFTER has extra blobs from green area → LOWER_GREEN range too wide
+    # Note: no green subtraction in binary anymore (Plan B)
+    # So Binary AFTER may show the green square area as white — this is normal
+    # The green area is excluded from centroid math in Block 8, not here
     # Future: move to display/debug_view.py → view.draw_debug_windows(...)
     # ================================================================
 
@@ -787,53 +875,42 @@ while True:
         if frame_count - last_debug_frame >= DEBUG_REFRESH_FRAMES:
             last_debug_frame = frame_count
 
-            # Binary BEFORE green subtraction — shows raw threshold result
-            # Compare with AFTER to see exactly what subtraction removes
-            before_display = cv2.resize(binary_before_sub, None,
+            # Binary BEFORE CLOSE — shows raw threshold result
+            # Should show two thin white lines (tape edges)
+            before_display = cv2.resize(binary_before_close, None,
                                         fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
-            cv2.putText(before_display, "BINARY BEFORE subtraction",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
-            cv2.putText(before_display, "raw threshold only",
-                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+            cv2.putText(before_display,
+                        f"BINARY BEFORE CLOSE (block={THRESH_BLOCK_SIZE} c={THRESH_CONSTANT})",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
+            cv2.putText(before_display, "expect: two thin white edge lines",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
-            # Binary AFTER green subtraction + CLOSE kernel
-            # This is what findContours actually processes
+            # Binary AFTER CLOSE — what findContours processes
+            # Should show one solid white blob per tape section
+            # Green area may be white here — handled by Plan B not here
             after_display = cv2.resize(binary, None,
                                        fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
-            cv2.putText(after_display, "BINARY AFTER subtraction + CLOSE",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
-            cv2.putText(after_display, f"kernel={CLOSE_KERNEL_SIZE}px",
-                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+            cv2.putText(after_display,
+                        f"BINARY AFTER CLOSE (kernel={CLOSE_KERNEL_SIZE}px)",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
+            cv2.putText(after_display,
+                        "expect: solid white blob on tape (green ok here - Plan B)",
+                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
             # Green mask — shows which pixels are detected as green
             green_display = cv2.resize(green_mask, None,
                                        fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
             cv2.putText(green_display, "GREEN MASK",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
-            cv2.putText(green_display, f"H:{LOWER_GREEN[0]}-{UPPER_GREEN[0]} "
-                                       f"S:{LOWER_GREEN[1]}-{UPPER_GREEN[1]} "
-                                       f"V:{LOWER_GREEN[2]}-{UPPER_GREEN[2]}",
+            cv2.putText(green_display,
+                        f"H:{LOWER_GREEN[0]}-{UPPER_GREEN[0]} "
+                        f"S:{LOWER_GREEN[1]}-{UPPER_GREEN[1]} "
+                        f"V:{LOWER_GREEN[2]}-{UPPER_GREEN[2]}",
                         (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
             cv2.imshow("Debug - Binary BEFORE", before_display)
             cv2.imshow("Debug - Binary AFTER",  after_display)
             cv2.imshow("Debug - Green Mask",    green_display)
-
-            # ── EXTRA DIAGNOSTIC: show exactly what gets ANDed with binary ──
-            # bitwise_not(green_mask) = what survives after subtraction
-            # WHITE = kept, BLACK = removed
-            # Any unexpected black regions here = unexpected removal from binary
-            # Look for black spots that DON'T correspond to the green square location
-            not_green_display = cv2.resize(cv2.bitwise_not(green_mask_inset), None,
-                                           fx=DISPLAY_SCALE, fy=DISPLAY_SCALE)
-            cv2.putText(not_green_display,
-                        f"NOT GREEN MASK (inset {GREEN_SUBTRACT_INSET}px)",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2)
-            cv2.putText(not_green_display,
-                        "WHITE=kept  BLACK=removed  (inner square only)",
-                        (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-            cv2.imshow("Debug - NOT Green Mask", not_green_display)
-            
     else:
         cv2.destroyWindow("Debug - Binary BEFORE")
         cv2.destroyWindow("Debug - Binary AFTER")
@@ -847,8 +924,17 @@ while True:
 
     # Fix 2: single waitKey call — handles both display refresh and quit detection
     # Previously called twice per loop which doubled X11 flush cost (~18ms wasted)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    # Press 'f' to freeze frame for inspection, any key to unfreeze
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
         break
+    elif key == ord('f'):
+        # Freeze on current frame — useful to catch bad frames mid-run
+        # Prints Plan B stats so you can inspect what happened
+        print(f"FROZEN | pts_total={pts_total} pts_after_filter={pts_after_filter} "
+              f"green_boxes={len(green_boxes)} gap_flag={gap_flag} "
+              f"error={error} cx_centroid={cx_centroid} cx_top={cx_top}")
+        cv2.waitKey(0)   # wait until any key pressed to unfreeze
 
     t_end = time.perf_counter()
 
